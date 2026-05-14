@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Backups and temp files
+*.bak
+*.backup
+*.tar.gz
+*.tgz
+.backup/
+.backup_*/
+.bk
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local configs
+configs/local/
+*.local.yaml
+*.local.json
+
+# Logs
+*.log
+logs/
+
+# Workflows data (user-specific)
+workflows/
+*.db
+*.sqlite
+
+# Sensitive
+.env
+.secrets/
+credentials/

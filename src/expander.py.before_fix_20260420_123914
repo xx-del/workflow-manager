@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+Workflow Expander - 节点展开器
+
+职责：
+1. 检测嵌套节点（calls: workflow-manager）
+2. 递归加载子工作流
+3. 展开为原子步骤列表
+4. 传递上下文参数
+"""
+
+import sys
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+# 添加路径
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from tools.loader import loader
+
+
+class WorkflowExpander:
+    """工作流节点展开器"""
+    
+    def __init__(self):
+        self.max_depth = 10  # 防止无限递归
+    
+    def expand(
+        self,
+        nodes: List[Dict],
+        parent_context: Dict = None,
+        depth: int = 0
+    ) -> List[Dict]:
+        """
+        递归展开嵌套节点
+        
+        Args:
+            nodes: 节点列表
+            parent_context: 父工作流上下文（参数传递）
+            depth: 当前递归深度
+            
+        Returns:
+            展开后的原子步骤列表
+        """
+        if depth > self.max_depth:
+            raise ValueError(f"递归深度超过限制 ({self.max_depth})，可能存在循环引用")
+        
+        expanded = []
+        parent_context = parent_context or {}
+        
+        for node in nodes:
+            if node.get("calls") == "workflow-manager":
+                # 嵌套工作流节点 → 递归展开
+                sub_nodes = self._expand_nested_workflow(node, parent_context, depth)
+                expanded.extend(sub_nodes)
+            else:
+                # 原子节点 → 注入上下文后添加
+                expanded_node = self._inject_context(node, parent_context)
+                expanded.append(expanded_node)
+        
+        return expanded
+    
+    def _expand_nested_workflow(
+        self,
+        node: Dict,
+        parent_context: Dict,
+        depth: int
+    ) -> List[Dict]:
+        """
+        展开嵌套工作流节点
+        
+        Args:
+            node: 嵌套节点定义
+            parent_context: 父工作流上下文
+            depth: 当前递归深度
+            
+        Returns:
+            子工作流的展开节点
+        """
+        sub_workflow_name = node["name"]
+        
+        print(f"    [展开] {sub_workflow_name} (depth={depth})")
+        
+        # 加载子工作流
+        sub_workflow = loader.load(sub_workflow_name)
+        
+        if not sub_workflow:
+            raise ValueError(f"子工作流未找到: {sub_workflow_name}")
+        
+        # 合并上下文参数
+        child_context = self._merge_context(parent_context, node)
+        
+        # 添加子工作流标识
+        child_context["_sub_workflow"] = sub_workflow_name
+        
+        # 递归展开
+        return self.expand(sub_workflow["nodes"], child_context, depth + 1)
+    
+    def _merge_context(
+        self,
+        parent_context: Dict,
+        node: Dict
+    ) -> Dict:
+        """
+        合并父工作流上下文和节点参数
+        
+        Args:
+            parent_context: 父工作流上下文
+            node: 当前节点定义
+            
+        Returns:
+            合并后的上下文
+        """
+        context = dict(parent_context)  # 复制父上下文
+        
+        # 节点级别的参数覆盖父级
+        if "params" in node:
+            context.update(node["params"])
+        
+        # 从 node 的其他字段提取参数
+        for key in ["date_start", "date_end", "input", "output"]:
+            if key in node:
+                context[key] = node[key]
+        
+        return context
+    
+    def _inject_context(
+        self,
+        node: Dict,
+        context: Dict
+    ) -> Dict:
+        """
+        将上下文注入到原子节点
+        
+        Args:
+            node: 原子节点定义
+            context: 上下文参数
+            
+        Returns:
+            注入上下文后的节点
+        """
+        # 复制节点
+        injected = dict(node)
+        
+        # 如果有 task 字段，进行参数替换
+        if "task" in injected:
+            task = injected["task"]
+            for key, value in context.items():
+                if not key.startswith("_"):  # 跳过内部字段
+                    placeholder = f"{{{{params.{key}}}}}"
+                    if placeholder in task:
+                        task = task.replace(placeholder, str(value))
+            injected["task"] = task
+        
+        # 添加上下文元数据
+        if context.get("_sub_workflow"):
+            injected["_source_workflow"] = context["_sub_workflow"]
+        
+        return injected
+    
+    def get_expansion_stats(
+        self,
+        nodes: List[Dict],
+        parent_context: Dict = None
+    ) -> Dict[str, Any]:
+        """
+        获取展开统计信息（不实际展开）
+        
+        Args:
+            nodes: 节点列表
+            parent_context: 父工作流上下文
+            
+        Returns:
+            统计信息
+        """
+        stats = {
+            "total_nodes": 0,
+            "nested_nodes": 0,
+            "atomic_nodes": 0,
+            "sub_workflows": []
+        }
+        
+        for node in nodes:
+            stats["total_nodes"] += 1
+            
+            if node.get("calls") == "workflow-manager":
+                stats["nested_nodes"] += 1
+                stats["sub_workflows"].append(node["name"])
+                
+                # 递归统计子工作流
+                sub_workflow = loader.load(node["name"])
+                if sub_workflow:
+                    sub_stats = self.get_expansion_stats(
+                        sub_workflow["nodes"],
+                        parent_context
+                    )
+                    stats["total_nodes"] += sub_stats["total_nodes"]
+                    stats["nested_nodes"] += sub_stats["nested_nodes"]
+                    stats["atomic_nodes"] += sub_stats["atomic_nodes"]
+                    stats["sub_workflows"].extend(sub_stats["sub_workflows"])
+            else:
+                stats["atomic_nodes"] += 1
+        
+        return stats
+
+
+# 单例实例
+workflow_expander = WorkflowExpander()

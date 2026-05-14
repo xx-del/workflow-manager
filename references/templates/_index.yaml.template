@@ -1,0 +1,39 @@
+# _index.yaml 标准模板
+# 
+# 重要约束：
+# 1. nodes[].name 必须与 WORKFLOW.md 中的步骤名称完全一致
+# 2. 步骤数量必须与 WORKFLOW.md 中的步骤数量一致
+# 3. 步骤顺序必须与 WORKFLOW.md 中的步骤顺序一致
+
+name: {工作流名称}
+type: leaf  # 工作流类型：leaf（叶子节点）或 branch（分支节点）
+description: {工作流描述}
+version: 1.0.0
+mode: serial  # serial（串行）或 parallel（并行）
+
+# 工作目录（可选）
+work_dir: {工作目录}
+output_dir: {输出目录}
+
+# 步骤节点
+# ⚠️ name 必须与 WORKFLOW.md 的 "### 步骤 N: {name}" 完全一致
+nodes:
+  - id: 1
+    name: {步骤1名称}  # 必须与 WORKFLOW.md 步骤1名称一致
+    calls: agent-pool
+    capabilities:
+      - {能力1}
+      - {能力2}
+    depends_on: []
+    
+  - id: 2
+    name: {步骤2名称}  # 必须与 WORKFLOW.md 步骤2名称一致
+    calls: agent-pool
+    capabilities:
+      - {能力1}
+    depends_on: [1]
+
+# 执行配置
+config:
+  timeout: {超时秒数}
+  retry: {重试次数}

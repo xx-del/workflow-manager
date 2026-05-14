@@ -1,0 +1,4 @@
+name: workflow-context
+description: "显示活动工作流状态 + 提醒使用agent-pool"
+events:
+  - UserPromptSubmit

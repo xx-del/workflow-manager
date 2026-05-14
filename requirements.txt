@@ -1,0 +1,11 @@
+# workflow-manager 依赖声明
+# 安装命令: pip install -r requirements.txt
+
+# 核心依赖
+pyyaml>=6.0
+
+# 异步支持（Python 3.7+ 内置）
+# asyncio - 标准库，无需安装
+
+# 类型提示支持（Python 3.5+ 内置）
+# typing - 标准库，无需安装

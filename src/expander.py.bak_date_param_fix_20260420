@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""
+Workflow Expander - 节点展开器（增强版）
+
+职责：
+1. 检测嵌套节点（calls: workflow-manager）
+2. 递归加载子工作流
+3. 展开为原子步骤列表
+4. 传递上下文参数
+5. 【新增】ID映射与依赖更新
+6. 【新增】跨工作流依赖处理
+"""
+
+import sys
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Set
+
+# 添加路径
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from tools.loader import loader
+
+
+class WorkflowExpander:
+    """工作流节点展开器（增强版）"""
+    
+    def __init__(self):
+        self.max_depth = 10  # 防止无限递归
+        self.id_mapping = {}  # 子工作流内部节点ID映射 {原始ID: 展开后ID}
+        self.main_node_mapping = {}  # 主工作流节点ID映射 {主节点ID: 子工作流出口节点ID}
+        self.workflow_exits = {}  # 工作流出口节点 {工作流名: 末节点ID}
+    
+    def expand(
+        self,
+        nodes: List[Dict],
+        parent_context: Dict = None,
+        depth: int = 0
+    ) -> List[Dict]:
+        """
+        递归展开嵌套节点（增强版）
+        
+        Args:
+            nodes: 节点列表
+            parent_context: 父工作流上下文（参数传递）
+            depth: 当前递归深度
+            
+        Returns:
+            展开后的原子步骤列表（所有依赖已正确映射）
+        """
+        if depth > self.max_depth:
+            raise ValueError(f"递归深度超过限制 ({self.max_depth})，可能存在循环引用")
+        
+        expanded = []
+        parent_context = parent_context or {}
+        
+        # 获取当前工作流名称（用于生成前缀）
+        workflow_name = parent_context.get("_sub_workflow", "root")
+        
+        # 获取继承的依赖（来自父工作流节点）
+        inherited_depends = parent_context.get("_inherited_depends", [])
+        
+        # 标记是否是子工作流的第一个节点
+        is_first_node = True
+        
+        for node in nodes:
+            if node.get("calls") == "workflow-manager":
+                # 嵌套工作流节点 → 递归展开
+                sub_nodes = self._expand_nested_workflow(node, parent_context, depth)
+                
+                # 记录子工作流的出口节点
+                exit_node = self._find_exit_node(sub_nodes)
+                if exit_node:
+                    # 关键：建立 主工作流节点ID → 子工作流出口节点 的映射
+                    # 使用单独的 main_node_mapping 避免与子工作流内部映射冲突
+                    node_id = str(node.get("id", ""))
+                    if node_id:
+                        self.main_node_mapping[node_id] = exit_node
+                    self.workflow_exits[node["name"]] = exit_node
+                
+                expanded.extend(sub_nodes)
+                is_first_node = False  # 展开后已经不是第一个节点
+            else:
+                # 原子节点 → 注入上下文 + ID映射
+                expanded_node = self._inject_context(node, parent_context)
+                
+                # 新增：ID映射处理
+                expanded_node = self._apply_id_mapping(expanded_node, workflow_name)
+                
+                # 新增：如果是子工作流的第一个节点，继承主工作流节点的依赖
+                if is_first_node and inherited_depends:
+                    # 合并继承的依赖和节点自身的依赖
+                    existing_deps = expanded_node.get("depends_on", [])
+                    expanded_node["depends_on"] = list(set(inherited_depends + existing_deps))
+                    is_first_node = False  # 只有第一个节点继承依赖
+                
+                expanded.append(expanded_node)
+        
+        # 新增：更新所有依赖引用
+        expanded = self._update_dependencies(expanded, parent_context)
+        
+        return expanded
+    
+    def _apply_id_mapping(
+        self,
+        node: Dict,
+        workflow_name: str
+    ) -> Dict:
+        """
+        应用ID映射（新增方法）
+        
+        Args:
+            node: 节点定义
+            workflow_name: 工作流名称
+            
+        Returns:
+            ID已映射的节点
+        """
+        # 复制节点
+        mapped = dict(node)
+        
+        # 获取原始ID
+        original_id = str(node.get("id", ""))
+        
+        if not original_id:
+            return mapped
+        
+        # 生成展开后的ID
+        expanded_id = f"root_{workflow_name}_{original_id}"
+        
+        # 记录映射关系
+        self.id_mapping[original_id] = expanded_id
+        
+        # 更新节点ID
+        mapped["id"] = expanded_id
+        mapped["_original_id"] = original_id  # 保留原始ID用于调试
+        
+        return mapped
+    
+    def _update_dependencies(
+        self,
+        nodes: List[Dict],
+        parent_context: Dict
+    ) -> List[Dict]:
+        """
+        更新所有节点的依赖引用（新增方法）
+        
+        Args:
+            nodes: 节点列表
+            parent_context: 父上下文
+            
+        Returns:
+            依赖已更新的节点列表
+        """
+        updated_nodes = []
+        
+        for node in nodes:
+            updated_node = dict(node)
+            
+            if "depends_on" not in updated_node:
+                updated_nodes.append(updated_node)
+                continue
+            
+            updated_deps = []
+            for old_dep in updated_node["depends_on"]:
+                old_dep_str = str(old_dep)
+                
+                # 1. 优先查找主工作流节点映射（跨工作流依赖）
+                if old_dep_str in self.main_node_mapping:
+                    updated_deps.append(self.main_node_mapping[old_dep_str])
+                # 2. 查找子工作流内部节点映射
+                elif old_dep_str in self.id_mapping:
+                    updated_deps.append(self.id_mapping[old_dep_str])
+                # 3. 尝试解析跨工作流依赖（通过名称）
+                elif self._is_cross_workflow_dependency(old_dep_str, parent_context):
+                    resolved = self._resolve_cross_workflow_dependency(old_dep_str, parent_context)
+                    if resolved:
+                        updated_deps.append(resolved)
+                    else:
+                        # 警告：无法解析的跨工作流依赖
+                        print(f"⚠️ 警告: 跨工作流依赖 {old_dep_str} 无法解析")
+                        updated_deps.append(old_dep_str)
+                else:
+                    # 保留原依赖（可能是尚未处理的节点）
+                    updated_deps.append(old_dep_str)
+            
+            updated_node["depends_on"] = updated_deps
+            updated_nodes.append(updated_node)
+        
+        return updated_nodes
+    
+    def _is_cross_workflow_dependency(
+        self,
+        dep_id: str,
+        parent_context: Dict
+    ) -> bool:
+        """
+        判断是否为跨工作流依赖（新增方法）
+        
+        Args:
+            dep_id: 依赖ID
+            parent_context: 父上下文
+            
+        Returns:
+            是否为跨工作流依赖
+        """
+        # 如果依赖ID不在当前映射表中，可能是跨工作流依赖
+        return dep_id not in self.id_mapping and parent_context.get("_sub_workflow")
+    
+    def _resolve_cross_workflow_dependency(
+        self,
+        dep_id: str,
+        parent_context: Dict
+    ) -> Optional[str]:
+        """
+        解析跨工作流依赖（新增方法）
+        
+        Args:
+            dep_id: 依赖ID
+            parent_context: 父上下文
+            
+        Returns:
+            解析后的节点ID，或None
+        """
+        # dep_id 可能是子工作流的名称
+        if dep_id in self.workflow_exits:
+            return self.workflow_exits[dep_id]
+        
+        # 尝试在工作流名称映射中查找
+        for workflow_name, exit_node in self.workflow_exits.items():
+            if dep_id in workflow_name or workflow_name in dep_id:
+                return exit_node
+        
+        return None
+    
+    def _find_exit_node(self, nodes: List[Dict]) -> Optional[str]:
+        """
+        找到工作流的出口节点（新增方法）
+        
+        Args:
+            nodes: 节点列表
+            
+        Returns:
+            出口节点ID，或None
+        """
+        if not nodes:
+            return None
+        
+        # 收集所有节点ID
+        all_ids = set()
+        depended_ids = set()
+        
+        for node in nodes:
+            node_id = node.get("id")
+            if node_id:
+                all_ids.add(str(node_id))
+            
+            for dep in node.get("depends_on", []):
+                depended_ids.add(str(dep))
+        
+        # 出口节点：不被任何节点依赖的节点
+        exit_candidates = all_ids - depended_ids
+        
+        if exit_candidates:
+            return list(exit_candidates)[0]
+        
+        # 如果所有节点都被依赖，返回最后一个节点
+        return str(nodes[-1].get("id")) if nodes else None
+    
+    def _expand_nested_workflow(
+        self,
+        node: Dict,
+        parent_context: Dict,
+        depth: int
+    ) -> List[Dict]:
+        """
+        展开嵌套工作流节点
+        
+        Args:
+            node: 嵌套节点定义
+            parent_context: 父工作流上下文
+            depth: 当前递归深度
+            
+        Returns:
+            子工作流的展开节点
+        """
+        sub_workflow_name = node["name"]
+        main_node_depends = node.get("depends_on", [])  # 主工作流节点的依赖
+        
+        print(f"    [展开] {sub_workflow_name} (depth={depth})")
+        
+        # 加载子工作流
+        sub_workflow = loader.load(sub_workflow_name)
+        
+        if not sub_workflow:
+            raise ValueError(f"子工作流未找到: {sub_workflow_name}")
+        
+        # 合并上下文参数
+        child_context = self._merge_context(parent_context, node)
+        
+        # 添加子工作流标识
+        child_context["_sub_workflow"] = sub_workflow_name
+        # 传递主工作流节点的依赖给子工作流
+        child_context["_inherited_depends"] = main_node_depends
+        
+        # 递归展开
+        return self.expand(sub_workflow["nodes"], child_context, depth + 1)
+    
+    def _merge_context(
+        self,
+        parent_context: Dict,
+        node: Dict
+    ) -> Dict:
+        """
+        合并父工作流上下文和节点参数
+        
+        Args:
+            parent_context: 父工作流上下文
+            node: 当前节点定义
+            
+        Returns:
+            合并后的上下文
+        """
+        context = dict(parent_context)  # 复制父上下文
+        
+        # 节点级别的参数覆盖父级
+        if "params" in node:
+            context.update(node["params"])
+        
+        # 从 node 的其他字段提取参数
+        for key in ["date_start", "date_end", "input", "output"]:
+            if key in node:
+                context[key] = node[key]
+        
+        return context
+    
+    def _inject_context(
+        self,
+        node: Dict,
+        context: Dict
+    ) -> Dict:
+        """
+        将上下文注入到原子节点
+        
+        Args:
+            node: 原子节点定义
+            context: 上下文参数
+            
+        Returns:
+            注入上下文后的节点
+        """
+        # 复制节点
+        injected = dict(node)
+        
+        # 如果有 task 字段，进行参数替换
+        if "task" in injected:
+            task = injected["task"]
+            for key, value in context.items():
+                if not key.startswith("_"):  # 跳过内部字段
+                    placeholder = f"{{{{params.{key}}}}}"
+                    if placeholder in task:
+                        task = task.replace(placeholder, str(value))
+            injected["task"] = task
+        
+        # 添加上下文元数据
+        if context.get("_sub_workflow"):
+            injected["_source_workflow"] = context["_sub_workflow"]
+        
+        return injected
+    
+    def validate_dependencies(self, nodes: List[Dict]) -> Dict[str, Any]:
+        """
+        验证所有依赖引用都存在（新增方法）
+        
+        Args:
+            nodes: 节点列表
+            
+        Returns:
+            验证结果 {valid: bool, errors: List[str]}
+        """
+        all_ids = {str(n.get("id")) for n in nodes}
+        errors = []
+        
+        for node in nodes:
+            node_id = node.get("id")
+            for dep in node.get("depends_on", []):
+                dep_str = str(dep)
+                if dep_str not in all_ids:
+                    errors.append(f"节点 {node_id} 依赖不存在的节点 {dep_str}")
+        
+        if errors:
+            print("⚠️ 依赖验证失败:")
+            for err in errors:
+                print(f"  - {err}")
+        
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors
+        }
+    
+    def get_expansion_stats(
+        self,
+        nodes: List[Dict],
+        parent_context: Dict = None
+    ) -> Dict[str, Any]:
+        """
+        获取展开统计信息（不实际展开）
+        
+        Args:
+            nodes: 节点列表
+            parent_context: 父工作流上下文
+            
+        Returns:
+            统计信息
+        """
+        stats = {
+            "total_nodes": 0,
+            "nested_nodes": 0,
+            "atomic_nodes": 0,
+            "sub_workflows": [],
+            "id_mappings": len(self.id_mapping),
+            "workflow_exits": list(self.workflow_exits.keys())
+        }
+        
+        for node in nodes:
+            stats["total_nodes"] += 1
+            
+            if node.get("calls") == "workflow-manager":
+                stats["nested_nodes"] += 1
+                stats["sub_workflows"].append(node["name"])
+                
+                # 递归统计子工作流
+                sub_workflow = loader.load(node["name"])
+                if sub_workflow:
+                    sub_stats = self.get_expansion_stats(
+                        sub_workflow["nodes"],
+                        parent_context
+                    )
+                    stats["total_nodes"] += sub_stats["total_nodes"]
+                    stats["nested_nodes"] += sub_stats["nested_nodes"]
+                    stats["atomic_nodes"] += sub_stats["atomic_nodes"]
+                    stats["sub_workflows"].extend(sub_stats["sub_workflows"])
+            else:
+                stats["atomic_nodes"] += 1
+        
+        return stats
+    
+    def reset(self):
+        """
+        重置映射状态（用于新的展开任务）
+        """
+        self.id_mapping = {}
+        self.main_node_mapping = {}
+        self.workflow_exits = {}
+
+
+# 单例实例
+workflow_expander = WorkflowExpander()

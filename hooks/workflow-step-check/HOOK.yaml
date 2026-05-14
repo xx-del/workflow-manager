@@ -1,0 +1,6 @@
+name: workflow-step-check
+description: "工具调用前注入工作流约束"
+events:
+  - PreToolUse
+filter:
+  tool_name: "terminal|delegate_task|write_file|patch"

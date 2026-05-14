@@ -1,0 +1,4 @@
+name: workflow-cleanup
+description: "会话结束时检查工作流状态"
+events:
+  - Stop
